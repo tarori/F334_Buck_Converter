@@ -22,9 +22,8 @@ wp2=1/(Cout*ESR)
 wp3=2PI*fsw/2
 */
 
-// TYPE3Regulator v_regulator(3450, 4600, 10000, 100000, 314000, dt, 0, vout_max);
-TYPE3Regulator v_regulator(3768, 5157, 3768, 14857, 314159, dt, 0, vout_max);
-TYPE3Regulator i_regulator(3768, 5157, 3768, 14857, 314159, dt, 0, vout_max);
+TYPE3Regulator v_regulator(10714, 14285, 10714, 100000, 314159, dt, 0, vout_max);
+TYPE3Regulator i_regulator(10714, 14285, 10714, 100000, 314159, dt, 0, vout_max);
 
 alignas(4) uint16_t adc1_buf[2];
 alignas(4) uint16_t adc2_buf[2];
@@ -122,9 +121,10 @@ void callback_10ms()
 constexpr float vref = 3.30f;
 constexpr float voltage_div = 11.0f / 1.0f;
 constexpr float voltage_gain = 11.0f;
-constexpr float shunt_resistance = 0.010f;
-constexpr float current_mul = vref / 4095 / (10.382f / 0.382f) / shunt_resistance;
-constexpr float current_offset = 167.2f;
+constexpr float shunt_resistance = 0.92f * 0.020f;
+constexpr float current_mul = vref / 4095 / (5.399f / 0.399f) / shunt_resistance;
+constexpr float current_offset = 744.0f;
+constexpr float wire_resistance = 0.0f;
 
 constexpr float emergency_voltage = 24.0f;
 constexpr float emergency_current = 100.0f;
@@ -144,6 +144,8 @@ __attribute__((long_call, section(".ccmram"))) void callback_10us()
 
     Control::actual_current = (adc1_buf[0] - current_offset) * current_mul;
 
+    Control::actual_voltage -= wire_resistance * Control::actual_current_filtered;
+
     Control::actual_voltage_filtered += filter_tau * (Control::actual_voltage - Control::actual_voltage_filtered);
     Control::actual_current_filtered += filter_tau * (Control::actual_current - Control::actual_current_filtered);
 
@@ -154,9 +156,10 @@ __attribute__((long_call, section(".ccmram"))) void callback_10us()
     }
 
     Control::output_v = v_regulator(Control::target_voltage - Control::actual_voltage);
-    Control::output_i = i_regulator(Control::target_current - Control::actual_current);
+    Control::output_i = i_regulator(0.1f * (Control::target_current - Control::actual_current));
     Control::output = std::min(Control::output_v, Control::output_i);
     v_regulator.set_actual_output(Control::output);
+    i_regulator.set_actual_output(Control::output);
     pwm_set_duty(Control::output, true);
     // pwm_set_duty(10.0f, true);
 }
