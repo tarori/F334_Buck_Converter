@@ -22,8 +22,8 @@ wp2=1/(Cout*ESR)
 wp3=2PI*fsw/2
 */
 
-TYPE3Regulator v_regulator(10714, 14285, 10714, 100000, 314159, dt, 0, vout_max);
-TYPE3Regulator i_regulator(10714, 14285, 10714, 100000, 314159, dt, 0, vout_max);
+PIDRegulator v_regulator(2.0f, 1.0e+4f, 8.0e-5f, dt);
+PIDRegulator i_regulator(1.0f, 1.0e+4f, 1e-4f, dt);
 
 alignas(4) uint16_t adc1_buf[2];
 alignas(4) uint16_t adc2_buf[2];
@@ -39,12 +39,24 @@ volatile float actual_current_filtered = 0.0f;
 volatile float target_voltage = 0.0f;
 volatile float target_current = 0.0f;
 volatile float dac_voltage = 0.0f;
-volatile float target_dac_voltage = 0.0f;
 volatile float output_v;
 volatile float output_i;
 volatile float output;
 volatile bool emergency_occured = false;
 }  // namespace Control
+
+constexpr float vref = 3.30f;
+constexpr float voltage_div = 11.0f / 1.0f;
+constexpr float voltage_gain = 1.1f;
+constexpr float voltage_mid = 10.0f;
+constexpr float shunt_resistance = 0.92f * 0.020f;
+constexpr float current_mul = vref / 4095 / (5.399f / 0.399f) / shunt_resistance;
+constexpr float current_offset = 744.0f;
+constexpr float wire_resistance = 0.0f;
+
+constexpr float emergency_voltage = 24.0f;
+constexpr float emergency_current = 100.0f;
+constexpr float filter_tau = 0.01f;
 
 void main_loop()
 {
@@ -52,6 +64,9 @@ void main_loop()
     HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
 
     HAL_DAC_Start(&hdac1, DAC1_CHANNEL_2);
+
+    Control::dac_voltage = ((voltage_gain / voltage_div * voltage_mid) + 0.5f * vref) / (voltage_gain + 1);
+    HAL_DAC_SetValue(&hdac1, DAC1_CHANNEL_2, DAC_ALIGN_12B_R, Control::dac_voltage / vref * 4095.0f);
 
     hhrtim1.TimerParam[HRTIM_TIMERINDEX_TIMER_A].DMASrcAddress = (uint32_t)((void*)pwm_cnt_buf);
     hhrtim1.TimerParam[HRTIM_TIMERINDEX_TIMER_A].DMADstAddress = (uint32_t)((void*)&hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_A].CMP1xR);
@@ -81,6 +96,12 @@ void main_loop()
     while (1) {
         if (Control::emergency_occured) {
             printf("Emergency\n");
+            lcd.cls();
+            lcd.locate(0, 0);
+            lcd.printf("Emergency occured");
+            lcd.locate(0, 1);
+            lcd.printf("A:%6.2fV %5.2fA", Control::actual_voltage, Control::actual_current);
+            delay_ms(1000);
             continue;
         }
 
@@ -109,26 +130,19 @@ void callback_10ms()
         Control::target_voltage -= voltage_step;
     }
 
-
     if (current_volume > Control::target_current + current_step) {
         Control::target_current += current_step;
     }
     if (current_volume < Control::target_current - current_step) {
         Control::target_current -= current_step;
     }
+
+    /*
+    Control::target_voltage = 3.0f;
+    static int cycle = 0;
+    Control::target_current = (cycle++ % 10 < 5) ? 1.0f : 2.0f;
+    */
 }
-
-constexpr float vref = 3.30f;
-constexpr float voltage_div = 11.0f / 1.0f;
-constexpr float voltage_gain = 11.0f;
-constexpr float shunt_resistance = 0.92f * 0.020f;
-constexpr float current_mul = vref / 4095 / (5.399f / 0.399f) / shunt_resistance;
-constexpr float current_offset = 744.0f;
-constexpr float wire_resistance = 0.0f;
-
-constexpr float emergency_voltage = 24.0f;
-constexpr float emergency_current = 100.0f;
-constexpr float filter_tau = 0.01f;
 
 __attribute__((long_call, section(".ccmram"))) void callback_10us()
 {
@@ -136,15 +150,9 @@ __attribute__((long_call, section(".ccmram"))) void callback_10us()
         return;
     }
 
-    Control::target_dac_voltage = ((voltage_gain / voltage_div * Control::target_voltage) + vref / 2) / (voltage_gain + 1);
-    Control::dac_voltage += (Control::target_dac_voltage - Control::dac_voltage) * 0.25f;
-    HAL_DAC_SetValue(&hdac1, DAC1_CHANNEL_2, DAC_ALIGN_12B_R, Control::dac_voltage / vref * 4095.0f);
-
-    Control::actual_voltage = ((1 + voltage_gain) * Control::target_dac_voltage - adc2_buf[0] * vref / 4095.0f) / voltage_gain * voltage_div;
+    Control::actual_voltage = ((1 + voltage_gain) * Control::dac_voltage - adc2_buf[0] * vref / 4095.0f) / voltage_gain * voltage_div - wire_resistance * Control::actual_current_filtered;
 
     Control::actual_current = (adc1_buf[0] - current_offset) * current_mul;
-
-    Control::actual_voltage -= wire_resistance * Control::actual_current_filtered;
 
     Control::actual_voltage_filtered += filter_tau * (Control::actual_voltage - Control::actual_voltage_filtered);
     Control::actual_current_filtered += filter_tau * (Control::actual_current - Control::actual_current_filtered);
@@ -158,8 +166,20 @@ __attribute__((long_call, section(".ccmram"))) void callback_10us()
     Control::output_v = v_regulator(Control::target_voltage - Control::actual_voltage);
     Control::output_i = i_regulator(0.1f * (Control::target_current - Control::actual_current));
     Control::output = std::min(Control::output_v, Control::output_i);
-    v_regulator.set_actual_output(Control::output);
-    i_regulator.set_actual_output(Control::output);
+
+    Control::output = std::clamp((float)Control::output, 0.0f, vout_max);
+
+    if (Control::output_v - Control::output < -0.2f) {
+        v_regulator.revert_integ(false);
+    } else if (Control::output_v - Control::output > 0.2f) {
+        v_regulator.revert_integ(true);
+    }
+
+    if (Control::output_i - Control::output < -0.2f) {
+        i_regulator.revert_integ(false);
+    } else if (Control::output_i - Control::output > 0.2f) {
+        i_regulator.revert_integ(true);
+    }
+
     pwm_set_duty(Control::output, true);
-    // pwm_set_duty(10.0f, true);
 }
